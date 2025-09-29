@@ -293,7 +293,7 @@ package lynxTypes;
     // Network TCP/IP
     parameter integer N_TCP_CHANNELS = 2;
     parameter integer TCP_PORT_OFFS = 49152;
-    parameter integer TCP_PORT_ORDER = 10;
+    parameter integer TCP_PORT_ORDER = 9;
     parameter integer TCP_RSESSION_BITS = DEST_BITS + PID_BITS + DEST_BITS;
     parameter integer TCP_PORT_TABLE_DATA_BITS = 16;
     parameter integer TCP_PORT_REQ_BITS = 16;
@@ -382,6 +382,7 @@ package lynxTypes;
     parameter integer N_CARD_AXI = {{ cnfg.n_card_axi }};
     parameter integer N_STRM_AXI = {{ cnfg.n_strm_axi }};
     parameter integer N_RDMA_AXI = {{ cnfg.n_rdma_axi }};
+    parameter integer N_TCP_AXI = {{ cnfg.n_tcp_axi }};
 
     // ========================---------------------------------------------
     // Structs

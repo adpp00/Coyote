@@ -1,266 +1,278 @@
-/**
- * This file is part of the Coyote <https://github.com/fpgasystems/Coyote>
- *
- * MIT Licence
- * Copyright (c) 2021-2025, Systems Group, ETH Zurich
- * All rights reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
-
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
-
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
 `timescale 1ns / 1ps
-
 import lynxTypes::*;
 
 /**
- * @brief   TCP RX multiplexer
+ * RX arbitration 
  *
  */
 module tcp_rx_arbiter (
-    input  logic                        aclk,
-    input  logic                        aresetn,
-    
-    metaIntf.s                          rx_meta,
-    metaIntf.m                          m_rx_meta [N_REGIONS],
-    AXI4S.s                             axis_rx_data,
-    AXI4S.m                             m_rx_data [N_REGIONS],
+    input  logic                                  aclk,
+    input  logic                                  aresetn,
 
-    output logic [N_REGIONS-1:0]        m_wr_rdy
+    // Read descriptors from regions (slave side), arbitrated to m_rd_pkg
+    metaIntf.s                                    s_rd_pkg [N_REGIONS],  
+    metaIntf.m                                    m_rd_pkg,              
+
+    // RX meta in, broadcast-muxed to one region (exactly once per transfer)
+    metaIntf.s                                    s_rx_meta,              
+    metaIntf.m                                    m_rx_meta [N_REGIONS],  
+
+    // AXI4S data stream in, routed to one region
+    AXI4S.s                                       s_axis_rx,              
+    AXI4S.m                                       m_axis_rx [N_REGIONS]   
 );
 
-logic [N_REGIONS-1:0] ready_src;
-logic [N_REGIONS-1:0] valid_src;
-logic ready_snk;
-logic valid_snk;
-req_t [N_REGIONS-1:0] request_src;
-tcp_meta_r_t request_snk;
+  // ---------------------------------------------------------------------------
+  // Params
+  // ---------------------------------------------------------------------------
+  localparam int BEAT_LOG_BITS = $clog2(AXI_NET_BITS/8);  // 512b → 64B → 6
+  localparam int SEQ_W         = N_REGIONS_BITS + TCP_LEN_BITS;
 
-logic seq_snk_valid;
-logic seq_snk_ready;
-logic seq_src_valid;
-logic seq_src_ready;
+  // ---------------------------------------------------------------------------
+  // Arbiter: pick a region descriptor and output payload + selected VFID
+  // ---------------------------------------------------------------------------
+  logic [N_REGIONS_BITS-1:0] vfid_pick;
+  metaIntf #(.STYPE(tcp_rd_pkg_t)) rd_pkg ();
 
+  meta_arbiter #(.DATA_BITS($bits(tcp_rd_pkg_t))) i_meta_arb (
+    .aclk    (aclk),
+    .aresetn (aresetn),
+    .s_meta  (s_rd_pkg),
+    .m_meta  (rd_pkg),
+    .id_out  (vfid_pick)
+  );
 
-logic [N_REGIONS_BITS-1:0] vfid_snk;
-logic [N_REGIONS_BITS-1:0] vfid_next;
-logic [LEN_BITS-1:0] len_snk;
-logic [LEN_BITS-1:0] len_next;
-logic host_snk;
-logic last_snk;
-logic last_next;
+  // ---------------------------------------------------------------------------
+  // Sequencing queue: {vfid,len}
+  // - Enqueue only when both queue and downstream m_rd_pkg accept (same cycle)
+  // - m_rd_pkg.valid pulses exactly when item is actually enqueued (1:1 매칭)
+  // ---------------------------------------------------------------------------
+  metaIntf #(.STYPE(logic[SEQ_W-1:0])) seq_snk ();
+  metaIntf #(.STYPE(logic[SEQ_W-1:0])) seq_src ();
 
-metaIntf #(.STYPE(req_t)) req_que [N_REGIONS] ();
+  assign seq_snk.data = {vfid_pick, rd_pkg.data.len};
 
-// --------------------------------------------------------------------------------
-// I/O !!! interface 
-// --------------------------------------------------------------------------------
-for(genvar i = 0; i < N_REGIONS; i++) begin
-    assign req_que[i].valid = valid_src[i];
-    assign ready_src[i] = req_que[i].ready;
-    assign req_que[i].data = request_src[i];  
+  always_comb begin
+    seq_snk.valid  = 1'b0;
+    rd_pkg.ready   = 1'b0;
+    m_rd_pkg.valid = 1'b0;
+    m_rd_pkg.data  = rd_pkg.data;
 
-    meta_queue #(.DATA_BITS($bits(req_t))) inst_meta_que (.aclk(aclk), .aresetn(aresetn), .s_meta(req_que[i]), .m_meta(m_rx_meta[i])); 
-end
+    if (rd_pkg.valid) begin
+      seq_snk.valid  = m_rd_pkg.ready;
+      rd_pkg.ready   = seq_snk.ready & m_rd_pkg.ready;
+      m_rd_pkg.valid = seq_snk.ready;        // 실제 enq 시점 펄스
+    end
+  end
 
-assign valid_snk = rx_meta.valid;
-assign rx_meta.ready = ready_snk;
-assign request_snk = rx_meta.data;
-
-assign vfid_snk = rx_meta.data.vfid;
-assign len_snk = rx_meta.data.len[LEN_BITS-1:0];
-
-// --------------------------------------------------------------------------------
-// Mux command
-// --------------------------------------------------------------------------------
-always_comb begin
-    seq_snk_valid = seq_snk_ready & ready_src[vfid_snk] & valid_snk;
-    ready_snk = seq_snk_ready & ready_src[vfid_snk];
-end
-
-for(genvar i = 0; i < N_REGIONS; i++) begin
-    assign valid_src[i] = (vfid_snk == i) ? seq_snk_valid : 1'b0;
-    
-    assign request_src[i].vfid = request_snk.vfid;
-    assign request_src[i].pid = request_snk.pid;
-    assign request_src[i].dest = request_snk.dest;
-    assign request_src[i].len = request_snk.len;
-
-    assign request_src[i].opcode = TCP_OPCODE;
-    assign request_src[i].mode = 1'b0;
-    assign request_src[i].rdma = 1'b0;
-    assign request_src[i].remote = 1'b1;
-    assign request_src[i].last = 1'b1;
-    assign request_src[i].strm = STRM_CARD;
-    assign request_src[i].vaddr = 0;
-    assign request_src[i].actv = 1'b1;
-    assign request_src[i].host = 1'b0;
-    assign request_src[i].offs = 0;
-    assign request_src[i].rsrvd = 0;
-end
-
-queue_stream #(
-    .QTYPE(logic [N_REGIONS_BITS+LEN_BITS-1:0]),
+  queue #(
+    .QTYPE (logic [SEQ_W-1:0]),
     .QDEPTH(N_OUTSTANDING)
-) inst_seq_que_snk (
-    .aclk(aclk),
-    .aresetn(aresetn),
-    .val_snk(seq_snk_valid),
-    .rdy_snk(seq_snk_ready),
-    .data_snk({vfid_snk, len_snk}),
-    .val_src(seq_src_valid),
-    .rdy_src(seq_src_ready),
-    .data_src({vfid_next, len_next})
-);
+  ) i_seq_q (
+    .aclk     (aclk),
+    .aresetn  (aresetn),
+    .val_snk  (seq_snk.valid),
+    .rdy_snk  (seq_snk.ready),
+    .data_snk (seq_snk.data),
+    .val_src  (seq_src.valid),
+    .rdy_src  (seq_src.ready),
+    .data_src (seq_src.data)
+  );
 
-// --------------------------------------------------------------------------------
-// Mux data
-// --------------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // FSM (+ meta token)
+  // - Latch VFID/LEN per transfer
+  // - Beats = ceil(len/64B); counter runs 0..n_beats-1 (last_idx 저장)
+  // ---------------------------------------------------------------------------
+  typedef enum logic [0:0] { ST_IDLE, ST_MUX } state_t;
 
-// -- FSM
-typedef enum logic[0:0]  {ST_IDLE, ST_MUX} state_t;
-logic [0:0] state_C, state_N;
+  state_t                              state_C, state_N;
+  logic [N_REGIONS_BITS-1:0]           vfid_C, vfid_N;
+  logic [TCP_LEN_BITS-BEAT_LOG_BITS:0] cnt_C,  cnt_N;
+  logic [TCP_LEN_BITS-BEAT_LOG_BITS:0] n_last_C, n_last_N;  // last beat index
+  logic                                zero_len_C, zero_len_N;
+  logic                                meta_pending_C, meta_pending_N;    // 1 meta/transfer
 
-logic [N_REGIONS_BITS-1:0] vfid_C, vfid_N;
-logic [LEN_BITS-BEAT_LOG_BITS:0] cnt_C, cnt_N;
-
-logic tr_done;
-logic tmp_tlast;
-
-logic [AXI_NET_BITS-1:0] s_axis_wr_tdata;
-logic [AXI_NET_BITS/8-1:0] s_axis_wr_tkeep;
-logic s_axis_wr_tlast;
-logic s_axis_wr_tvalid;
-logic s_axis_wr_tready;
-
-logic [N_REGIONS-1:0][AXI_NET_BITS-1:0] m_axis_wr_tdata;
-logic [N_REGIONS-1:0][AXI_NET_BITS/8-1:0] m_axis_wr_tkeep;
-logic [N_REGIONS-1:0] m_axis_wr_tlast;
-logic [N_REGIONS-1:0] m_axis_wr_tvalid;
-logic [N_REGIONS-1:0] m_axis_wr_tready;
-
-logic [N_REGIONS-1:0][31:0] used;
-
-// --------------------------------------------------------------------------------
-// I/O !!! interface 
-// --------------------------------------------------------------------------------
-
-for(genvar i = 0; i < N_REGIONS; i++) begin 
-    axis_data_fifo_512_used inst_data_que (
-        .s_axis_aresetn(aresetn),
-        .s_axis_aclk(aclk),
-        .s_axis_tvalid(m_axis_wr_tvalid[i]),
-        .s_axis_tready(m_axis_wr_tready[i]),
-        .s_axis_tdata(m_axis_wr_tdata[i]),
-        .s_axis_tkeep(m_axis_wr_tkeep[i]),
-        .s_axis_tlast(m_axis_wr_tlast[i]),
-        .m_axis_tvalid(m_rx_data[i].tvalid),
-        .m_axis_tready(m_rx_data[i].tready),
-        .m_axis_tdata(m_rx_data[i].tdata),
-        .m_axis_tkeep(m_rx_data[i].tkeep),
-        .m_axis_tlast(m_rx_data[i].tlast),
-        .axis_wr_data_count(used[i])
-    );
-
-    assign m_wr_rdy[i] = used[i] <= RDMA_WR_NET_THRS; 
-end
-
-assign s_axis_wr_tvalid = axis_rx_data.tvalid;
-assign s_axis_wr_tdata  = axis_rx_data.tdata;
-assign s_axis_wr_tkeep  = axis_rx_data.tkeep;
-assign s_axis_wr_tlast  = axis_rx_data.tlast;
-assign axis_rx_data.tready = s_axis_wr_tready;
-
-// REG
-always_ff @(posedge aclk) begin: PROC_REG
-    if (aresetn == 1'b0) begin
-        state_C <= ST_IDLE;
+  // ---- Registers ----
+  always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+      state_C        <= ST_IDLE;
+      vfid_C         <= '0;
+      cnt_C          <= '0;
+      n_last_C       <= '0;
+      zero_len_C     <= 1'b0;
+      meta_pending_C <= 1'b0;
+    end else begin
+      state_C        <= state_N;
+      vfid_C         <= vfid_N;
+      cnt_C          <= cnt_N;
+      n_last_C       <= n_last_N;
+      zero_len_C     <= zero_len_N;
+      meta_pending_C <= meta_pending_N;
     end
-    else begin
-        state_C <= state_N;
-        cnt_C <= cnt_N;
-        vfid_C <= vfid_N;
+  end
+
+  // ---------------------------------------------------------------------------
+  // 1-beat registered slice between s_axis_rx and selected region
+  // ---------------------------------------------------------------------------
+  logic                                  pipe_v_C, pipe_v_N;
+  logic [AXI_NET_BITS-1:0]               pipe_d_C, pipe_d_N;
+  logic [AXI_NET_BITS/8-1:0]             pipe_k_C, pipe_k_N;
+  logic                                  pipe_l_C, pipe_l_N;
+
+  wire sel_ready      = (state_C == ST_MUX && !zero_len_C) ? m_axis_rx[vfid_C].tready : 1'b0;
+  wire down_fire      = pipe_v_C & sel_ready;                                  
+  wire up_ready_raw   = (!pipe_v_C) | down_fire;                               
+  wire up_ready_gate  = (state_C == ST_MUX && !zero_len_C) ? up_ready_raw : 1'b0;
+  wire up_fire        = s_axis_rx.tvalid & up_ready_gate;                      
+
+  always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+      pipe_v_C <= 1'b0;
+      pipe_d_C <= '0;
+      pipe_k_C <= '0;
+      pipe_l_C <= 1'b0;
+    end else begin
+      pipe_v_C <= pipe_v_N;
+      pipe_d_C <= pipe_d_N;
+      pipe_k_C <= pipe_k_N;
+      pipe_l_C <= pipe_l_N;
     end
-end
+  end
 
-// NSL
-always_comb begin: NSL
-	state_N = state_C;
+  always_comb begin
+    pipe_v_N = pipe_v_C;
+    pipe_d_N = pipe_d_C;
+    pipe_k_N = pipe_k_C;
+    pipe_l_N = pipe_l_C;
 
-	case(state_C)
-		ST_IDLE: 
-			state_N = (seq_src_valid) ? ST_MUX : ST_IDLE;
+    if (down_fire) begin
+      if (up_fire) begin
+        pipe_v_N = 1'b1;
+        pipe_d_N = s_axis_rx.tdata;
+        pipe_k_N = s_axis_rx.tkeep;
+        pipe_l_N = s_axis_rx.tlast;
+      end else begin
+        pipe_v_N = 1'b0;
+      end
+    end
+    else if (up_fire) begin
+      pipe_v_N = 1'b1;
+      pipe_d_N = s_axis_rx.tdata;
+      pipe_k_N = s_axis_rx.tkeep;
+      pipe_l_N = s_axis_rx.tlast;
+    end
+  end
 
-        ST_MUX:
-            state_N = tr_done ? (seq_src_valid ? ST_MUX : ST_IDLE) : ST_MUX;
+  // ---------------------------------------------------------------------------
+  // Next-state & datapath (FSM + meta token + 카운터)
+  // ---------------------------------------------------------------------------
+  always_comb begin
+    state_N        = state_C;
+    vfid_N         = vfid_C;
+    cnt_N          = cnt_C;
+    n_last_N       = n_last_C;
+    zero_len_N     = zero_len_C;
+    meta_pending_N = meta_pending_C;
 
-	endcase // state_C
-end
+    logic tr_fire = down_fire;
+    logic tr_last = tr_fire & (cnt_C == n_last_C);
+    logic tr_done = (zero_len_C ? (~meta_pending_C) : tr_last);
 
-// DP
-always_comb begin: DP
-    cnt_N = cnt_C;
-    vfid_N = vfid_C;
+    unique case (state_C)
+      // -----------------------------
+      ST_IDLE: begin
+        cnt_N = '0;
 
-    // Transfer done
-    tr_done = (cnt_C == 0) && (s_axis_wr_tvalid & s_axis_wr_tready);
+        if (seq_src.valid) begin
+          // 새 전송 래치
+          pop_seq = 1'b1;
 
-    seq_src_ready = 1'b0;
+          logic [SEQ_W-1:0]         raw;
+          logic [TCP_LEN_BITS-1:0]  len;
+          raw     = seq_src.data;
+          len     = raw[TCP_LEN_BITS-1:0];
+          vfid_N  = raw[TCP_LEN_BITS +: N_REGIONS_BITS];
 
-    // Last gen
-    tmp_tlast = 1'b0;
+          zero_len_N     = (len == '0);
+          meta_pending_N = 1'b1;  
 
-    case(state_C)
-        ST_IDLE: begin
-            if(seq_src_valid) begin
-                seq_src_ready = 1'b1;
-                vfid_N = vfid_next;
-                cnt_N = (len_next[BEAT_LOG_BITS-1:0] != 0) ? len_next[LEN_BITS-1:BEAT_LOG_BITS] : len_next[LEN_BITS-1:BEAT_LOG_BITS] - 1;
-            end
+          if (len == '0) begin
+            n_last_N = '0;        
+          end else begin
+            // last_idx = ceil(len/64B) - 1
+            n_last_N = (len[BEAT_LOG_BITS-1:0] != 0)
+                     ?  len[TCP_LEN_BITS-1:BEAT_LOG_BITS]
+                     : (len[TCP_LEN_BITS-1:BEAT_LOG_BITS] - 1);
+          end
+
+          state_N = ST_MUX;
         end
-            
-        ST_MUX: begin
-            if(tr_done) begin
-                cnt_N = 0;
-                if(seq_src_valid) begin
-                    seq_src_ready = 1'b1;
-                    vfid_N = vfid_next;
-                    cnt_N = (len_next[BEAT_LOG_BITS-1:0] != 0) ? len_next[LEN_BITS-1:BEAT_LOG_BITS] : len_next[LEN_BITS-1:BEAT_LOG_BITS] - 1;
-                end
-            end
-            else begin
-                cnt_N = (s_axis_wr_tvalid & s_axis_wr_tready) ? cnt_C - 1 : cnt_C;
+      end
+
+      // -----------------------------
+      ST_MUX: begin
+        if (tr_fire) begin
+          cnt_N = cnt_C + 1;
+        end
+
+        if (s_rx_meta.valid && m_rx_meta[vfid_C].ready && meta_pending_C) begin
+          meta_pending_N = 1'b0;
+        end
+
+        if (tr_done) begin
+          if (seq_src.valid) begin
+            pop_seq = 1'b1;
+
+            logic [SEQ_W-1:0]         raw;
+            logic [TCP_LEN_BITS-1:0]  len;
+            raw     = seq_src.data;
+            len     = raw[TCP_LEN_BITS-1:0];
+            vfid_N  = raw[TCP_LEN_BITS +: N_REGIONS_BITS];
+
+            zero_len_N     = (len == '0);
+            meta_pending_N = 1'b1;
+
+            if (len == '0) begin
+              n_last_N = '0;
+            end else begin
+              n_last_N = (len[BEAT_LOG_BITS-1:0] != 0)
+                       ?  len[TCP_LEN_BITS-1:BEAT_LOG_BITS]
+                       : (len[TCP_LEN_BITS-1:BEAT_LOG_BITS] - 1);
             end
 
-            tmp_tlast = (cnt_C == 0) ? 1'b1 : 1'b0;
+            cnt_N   = '0;
+            state_N = ST_MUX;
+          end else begin
+            state_N = ST_IDLE;
+          end
         end
-    
+      end
     endcase
-end
+  end
 
-// Mux
-for(genvar i = 0; i < N_REGIONS; i++) begin
-    assign m_axis_wr_tvalid[i] = (state_C == ST_MUX) ? ((i == vfid_C) ? s_axis_wr_tvalid : 1'b0) : 1'b0;
-    assign m_axis_wr_tdata[i] = s_axis_wr_tdata;
-    assign m_axis_wr_tkeep[i] = s_axis_wr_tkeep;
-    assign m_axis_wr_tlast[i] = tmp_tlast;
-end
+  logic pop_seq;
+  assign seq_src.ready = pop_seq;
 
-assign s_axis_wr_tready = (state_C == ST_MUX) ? m_axis_wr_tready[vfid_C] : 1'b0;
+  // ---------------------------------------------------------------------------
+  // AXI4S data mux (registered)
+  // ---------------------------------------------------------------------------
+  for (genvar i = 0; i < N_REGIONS; i++) begin : G_DATA_MUX
+    assign m_axis_rx[i].tvalid = (state_C == ST_MUX && !zero_len_C && i == vfid_C) ? pipe_v_C : 1'b0;
+    assign m_axis_rx[i].tdata  = pipe_d_C;
+    assign m_axis_rx[i].tkeep  = pipe_k_C;
+    assign m_axis_rx[i].tlast  = pipe_l_C;
+  end
+
+  assign s_axis_rx.tready = up_ready_gate;
+
+  // ---------------------------------------------------------------------------
+  // RX meta mux (once per transfer)
+  // ---------------------------------------------------------------------------
+  for (genvar i = 0; i < N_REGIONS; i++) begin : G_META_MUX
+    assign m_rx_meta[i].valid = (state_C == ST_MUX && meta_pending_C && (i == vfid_C)) ? s_rx_meta.valid : 1'b0;
+    assign m_rx_meta[i].data  = s_rx_meta.data;
+  end
+  assign s_rx_meta.ready = (state_C == ST_MUX && meta_pending_C) ? m_rx_meta[vfid_C].ready : 1'b0;
 
 endmodule

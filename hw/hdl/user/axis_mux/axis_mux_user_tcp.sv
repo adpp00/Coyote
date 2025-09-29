@@ -43,7 +43,7 @@ module axis_mux_user_tcp #(
     muxIntf.m                               m_rq,
 
     AXI4S.s                                 s_axis,
-    AXI4SR.m                                m_axis [N_DESTS]
+    AXI4S.m                                m_axis [N_DESTS]
 );
 
 // -- Constants

@@ -11,10 +11,10 @@
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
-
+ *
  * The above copyright notice and this permission notice shall be included in all
  * copies or substantial portions of the Software.
-
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -25,317 +25,353 @@
  */
 
 `timescale 1ns / 1ps
-
 import lynxTypes::*;
 
-`include "axi_macros.svh"
-`include "lynx_macros.svh"
-
 /**
- * @brief   TCP connection table
- * 
- * Arbitrates between open requests from vFPGAs.
+ * @brief TCP connection table
  *
+ * - Arbitrates open/close requests from vFPGAs.
+ * - On successful open, records SID->VFID mapping.
+ * - Routes notifications by SID if present; otherwise by dst_port via tcp_port_table.
+ * - TAG is unused; port table checks only the VALID bit.
+ * - No invalidation on close (avoids write contention); map is updated on open-success only.
  */
+
 module tcp_conn_table (
-    input  logic 									aclk,
-	input  logic 									aresetn,
+    input  logic                                   aclk,
+    input  logic                                   aresetn,
 
-    metaIntf.s                                      s_open_req,
-    metaIntf.m                                      m_open_req,
-    metaIntf.m                                      m_close_req,
+    // Open / Close
+    metaIntf.s                                     s_open_req [N_REGIONS],
+    metaIntf.m                                     m_open_req,
 
-    metaIntf.s                                      s_open_rsp,
-    metaIntf.m                                      m_open_rsp,
+    metaIntf.s                                     s_close_req [N_REGIONS],
+    metaIntf.m                                     m_close_req,
 
-    metaIntf.s                                      s_notify_opened,
-    output logic [TCP_PORT_ORDER-1:0]               port_addr,
-    input  logic [TCP_PORT_TABLE_DATA_BITS-1:0]     rsid_in,
+    metaIntf.s                                     s_open_rsp,
+    metaIntf.m                                     m_open_rsp [N_REGIONS],
 
-    metaIntf.s                                      s_rx_meta,
-    metaIntf.m                                      m_rx_meta_r,
-    AXI4S.s                                         s_axis_rx,
-    AXI4S.m                                         m_axis_rx_r,
+    // Notify
+    metaIntf.s                                     s_notify,
+    metaIntf.m                                     m_notify [N_REGIONS],
 
-    metaIntf.s                                      s_tx_meta_r,
-    metaIntf.m                                      m_tx_meta,
-    AXI4S.s                                         s_axis_tx_r,
-    AXI4S.m                                         m_axis_tx
+    // Port-table B-port proxy (lookup only)
+    output logic [TCP_IP_PORT_BITS-1:0]            port_addr,   // forward notify.dst_port
+    input  logic [TCP_PORT_TABLE_DATA_BITS-1:0]    rsid_in      // [VALID ... VFID(7:0)]
 );
 
+    // -- Constants --------------------------------------------------------------
+    localparam int PORT_BITS      = TCP_IP_PORT_BITS;
+    localparam int ADDR_BITS      = TCP_IP_ADDRESS_BITS;
+    localparam int SID_BITS       = TCP_SESSION_BITS;
 
-// -- Regs and signals
-typedef enum logic[3:0] {ST_IDLE, ST_LUP_PORT, ST_CLOSE, ST_LUP_OPEN,
-                         ST_LUP_PORT_WAIT, ST_PORT_RSP,
-                         ST_OPEN_RSP_WAIT, ST_OPEN, ST_OPEN_RSP_FAIL, ST_OPEN_RSP_SUCCESS} state_t;
-logic [3:0] state_C, state_N;
+    localparam int VFPGA_BITS     = 8;                              // VFID width used in port table
+    localparam int SID_ADDR_BITS  = 8;                              // max 256 SIDs -> use lower 8 bits
+    localparam int SID_DATA_BITS  = 1 + VFPGA_BITS;                 // {VALID(1), VFID(8)}
+    localparam int SID_WSTRB_BITS = (SID_DATA_BITS+7)/8;
 
-logic [TCP_IP_PORT_BITS-1:0] port_C, port_N;
-logic [TCP_SID_BITS-1:0] sid_C, sid_N;
-logic [DEST_BITS-1:0] vfid_C, vfid_N;
-logic [PID_BITS-1:0] pid_C, pid_N;
-logic [DEST_BITS-1:0] dest_C, dest_N;
-logic [TCP_IP_PORT_BITS-1:0] ip_port_C, ip_port_N;
-logic [TCP_IP_ADDRESS_BITS-1:0] ip_address_C, ip_address_N;
+    localparam int PT_DATA_BITS   = TCP_PORT_TABLE_DATA_BITS;       // e.g., 16 = {VALID, TAG?, VFID}
+    localparam int PT_VALID_BIT   = PT_DATA_BITS-1;                 // MSB = VALID
 
-// Tables
-logic [1:0] rx_wr;
-logic [TCP_SID_BITS-1:0] rx_addr;
-logic rx_en;
-logic [DEST_BITS+PID_BITS+DEST_BITS-1:0] rx_data;
-logic [DEST_BITS+PID_BITS+DEST_BITS-1:0] rx_data_out;
-logic [DEST_BITS+PID_BITS+DEST_BITS-1:0] rx_rsid;
+    // -- Regs and signals -------------------------------------------------------
+    // Open FSM
+    typedef enum logic [1:0] { ST_O_IDLE, ST_O_SEND, ST_O_RSP_WAIT } o_state_t;
+    o_state_t                         o_state_C, o_state_N;
 
-logic [1:0] tx_wr;
-logic [DEST_BITS+PID_BITS] tx_addr;
-logic tx_en;
-logic [TCP_SID_BITS-1:0] tx_data;
-logic [TCP_SID_BITS-1:0] tx_data_out;
-logic [TCP_SID_BITS-1:0] tx_data_sid;
+    logic [PORT_BITS-1:0]             o_port_C,  o_port_N;
+    logic [ADDR_BITS-1:0]             o_addr_C,  o_addr_N;
+    logic [N_REGIONS_BITS-1:0]        o_vfid_C,  o_vfid_N;
 
-// REG
-always_ff @( posedge aclk ) begin : REG_LISTEN
-    if(aresetn == 1'b0) begin
-        state_C <= ST_IDLE;
+    // Open RSP capture
+    logic                             open_rsp_fire;
+    logic                             open_rsp_success;                 // s_open_rsp.data[0]
+    logic [SID_BITS-1:0]              open_rsp_sid;
 
-        port_C <= 'X;
-        sid_C <= 'X;
-        vfid_C <= 'X;
-        pid_C <= 'X;
-        dest_C <= 'X;
-        ip_port_C <= 'X;
-        ip_address_C <= 'X;
-    else begin
-        state_C <= state_N;
+    // SID map (A=write, B=read)
+    logic [SID_ADDR_BITS-1:0]         sid_waddr, sid_raddr;
+    logic [SID_DATA_BITS-1:0]         sid_wdata, sid_rdata;
+    logic [SID_WSTRB_BITS-1:0]        sid_we;
 
-        port_C <= port_N;
-        sid_C <= sid_N;
-        vfid_C <= vfid_N;
-        pid_C <= pid_N;
-        dest_C <= dest_N;
-        ip_port_C <= ip_port_N;
-        ip_address_C <= ip_address_N;
+    // Notify FSM
+    typedef enum logic [2:0] { N_IDLE, N_SID_LUP, N_PICK, N_PT_LOOKUP, N_ROUTE } n_state_t;
+    n_state_t                         n_state_C, n_state_N;
+
+    tcp_notify_t                      not_C, not_N;
+
+    // SID hit / port-table result
+    logic                             sid_hit;
+    logic [7:0]                       vfid_from_sid_8;
+    logic [7:0]                       vfid_from_port_8;
+    logic                             pt_valid_now;
+
+    // Route latches (glitch-free)
+    logic                             route_sel_sid_C,  route_sel_sid_N;  // 1: SID route, 0: port route
+    logic                             route_pt_valid_C, route_pt_valid_N; // latched port-table VALID
+    logic [N_REGIONS_BITS-1:0]        route_vfid_C,     route_vfid_N;     // final VFID
+
+    // -- Arbitration ------------------------------------------------------------
+    // Open
+    metaIntf #(.STYPE(tcp_open_req_t)) open_req_arb ();
+    logic [N_REGIONS_BITS-1:0] vfid_open_arb;
+
+    meta_arbiter #(
+        .DATA_BITS($bits(tcp_open_req_t))
+    ) i_tcp_open_req_arb_in (
+        .aclk    (aclk),
+        .aresetn (aresetn),
+        .s_meta  (s_open_req),
+        .m_meta  (open_req_arb),
+        .id_out  (vfid_open_arb)
+    );
+
+    // Close (pass-through, no map invalidation)
+    meta_arbiter #(
+        .DATA_BITS($bits(tcp_close_req_t))
+    ) i_tcp_close_req_arb_in (
+        .aclk    (aclk),
+        .aresetn (aresetn),
+        .s_meta  (s_close_req),
+        .m_meta  (m_close_req),
+        .id_out  (/*unused*/)
+    );
+
+    // -- Decodes ----------------------------------------------------------------
+    assign sid_hit          = sid_rdata[SID_DATA_BITS-1];     // VALID
+    assign vfid_from_sid_8  = sid_rdata[VFPGA_BITS-1:0];
+    assign vfid_from_port_8 = rsid_in[VFPGA_BITS-1:0];
+    assign pt_valid_now     = rsid_in[PT_VALID_BIT];
+
+    function automatic [N_REGIONS_BITS-1:0] vf_cast8 (input [7:0] v);
+        vf_cast8 = v[N_REGIONS_BITS-1:0]; // N_REGIONS ≤ 256
+    endfunction
+
+    // -- REG (OPEN) -------------------------------------------------------------
+    always_ff @(posedge aclk) begin : REG_OPEN
+        if (!aresetn) begin
+            o_state_C <= ST_O_IDLE;
+            o_port_C  <= '0;
+            o_addr_C  <= '0;
+            o_vfid_C  <= '0;
+        end
+        else begin
+            o_state_C <= o_state_N;
+            o_port_C  <= o_port_N;
+            o_addr_C  <= o_addr_N;
+            o_vfid_C  <= o_vfid_N;
+        end
     end
-end
 
-// NSL
-always_comb begin : NSL
-    state_N = state_C;
-
-    case (state_C)
-        ST_IDLE: begin
-            if(s_notify_opened.valid) begin
-                state_N = ST_LUP_PORT;
-            end
-            else if(s_open_req.valid) begin
-                if(s_open_req.data.close)
-                    state_N = ST_CLOSE;
-                else
-                    state_N = ST_LUP_OPEN;
-            end
+    // -- REG (NOTIFY) -----------------------------------------------------------
+    always_ff @(posedge aclk) begin : REG_NOTIFY
+        if (!aresetn) begin
+            n_state_C        <= N_IDLE;
+            not_C            <= '0;
+            route_vfid_C     <= '0;
+            route_sel_sid_C  <= 1'b0;
+            route_pt_valid_C <= 1'b0;
         end
-
-        ST_LUP_PORT:
-            state_N = ST_LUP_PORT_WAIT;
-        ST_LUP_PORT_WAIT: 
-            state_N = ST_PORT_RSP;
-        ST_PORT_RSP:
-            state_N = m_rx_meta_q.ready && m_tx_meta_q.ready ? ST_PORT_RSP : ST_IDLE;
-
-        ST_CLOSE:
-            state_N = m_close_req.ready ? ST_IDLE : ST_CLOSE;
-
-        ST_LUP_OPEN:
-            state_N = m_open_req.ready ? ST_OPEN_RSP_WAIT : ST_LUP_OPEN;
-        ST_OPEN_RSP_WAIT:
-            state_N = s_open_rsp.valid ? (s_open_rsp.data.success ? ST_OPEN : ST_OPEN_RSP_FAIL) : ST_OPEN_RSP_WAIT;
-        ST_OPEN:
-            state_N = ST_OPEN_RSP_SUCCESS;
-        ST_OPEN_RSP_SUCCESS | ST_OPEN_RSP_FAIL:
-            if(m_open_rsp.ready) state_N = ST_IDLE;
-    endcase
-end
-
-// DP
-always_comb begin : DP
-    port_N = port_C;
-    sid_N = sid_C;
-    vfid_N = vfid_C;
-    pid_N = pid_C;
-    dest_N = dest_C;
-    ip_port_N = ip_port_C;
-    ip_address_N = ip_address_C;
-
-    s_notify_opened.ready = 1'b0;
-
-    s_open_req.ready = 1'b0;
-
-    m_close_req.valid = 1'b0;
-    m_close_req.data = 0;
-    m_close_req.data.sid = tx_data_out;
-
-    m_open_req.valid = 1'b0;
-    m_open_req.data = 0;
-    m_open_req.data.ip_port = ip_port_C;
-    m_open_req.data.ip_address = ip_address_C;
-
-    s_open_rsp.ready = 1'b0;
-    m_open_rsp.valid = 1'b0;
-    m_open_rsp.data = 0;
-    m_open_rsp.data.vfid = vfid_C;
-    m_open_rsp.data.pid = pid_C;
-    m_open_rsp.data.success = 1'b0;
-
-    rx_addr = 0;
-    rx_data = 0;
-    rx_wr = 0;
-
-    tx_addr = 0;
-    tx_data = 0;
-    tx_wr = 0;
-
-
-    port_addr = port_C[TCP_PORT_ORDER-1:0];
-
-    case (state_C)
-        ST_IDLE: begin
-            if(s_notify_opened.valid) begin
-                s_notify_opened.ready = 1'b1;
-
-                port_N = s_notify_opened.data.dst_port - TCP_PORT_OFFS;
-                sid_N = s_notify_opened.data.sid;
-            end
-            else if(s_open_req.valid) begin
-                s_open_req.ready = 1'b1;
-
-                vfid_N = s_open_req.data.vfid;
-                pid_N = s_open_req.data.pid;
-                dest_N = s_open_req.data.dest;
-                ip_port_N = s_open_req.data.ip_port;
-                ip_address_N = s_open_req.data.ip_address;
-            end
+        else begin
+            n_state_C        <= n_state_N;
+            not_C            <= not_N;
+            route_vfid_C     <= route_vfid_N;
+            route_sel_sid_C  <= route_sel_sid_N;
+            route_pt_valid_C <= route_pt_valid_N;
         end
-
-        ST_PORT_RSP: begin
-            rx_addr = sid_C[TCP_SID_BITS];
-            rx_data[0+:DEST_BITS+PID_BITS+DEST_BITS] = rsid_in[0+:DEST_BITS+PID_BITS+DEST_BITS];
-
-            tx_addr = rsid_in[DEST_BITS+:PID_BITS+DEST_BITS];
-            tx_data = sid_C[TCP_SID_BITS];
-
-            if(rsid_in[TCP_RSESSION_BITS-1]) begin
-                tx_wr = ~0;
-                rx_wr = ~0;
-            end
-        end
-
-        ST_CLOSE: begin
-            m_close_req.valid = 1'b1;
-        end
-
-        ST_LUP_OPEN: begin
-            m_open_req.valid = 1'b1;
-        end
-
-        ST_OPEN_RSP_WAIT: begin
-            s_open_rsp.ready = 1'b1;
-            sid_N = s_open_rsp.data.sid;
-        end
-
-        ST_OPEN: begin
-            rx_addr = sid_C[TCP_SID_BITS];
-            rx_data[0+:PID_BITS+DEST_BITS] = {vfid_C, pid_C, dest_C};
-
-            tx_addr = {vfid_C, pid_C};
-            tx_data = sid_C[TCP_SID_BITS];
-
-            tx_wr = ~0;
-            rx_wr = ~0;
-        end
-
-        ST_OPEN_RSP_FAIL: begin
-            m_open_rsp.valid = 1'b1;
-            m_open_rsp.data.success = 1'b0;
-        end
-
-        ST_OPEN_RSP_SUCCESS: begin
-            m_open_rsp.valid = 1'b1;
-            m_open_rsp.data.success = 1'b1;
-        end
-
-    endcase
-end
-
-// RX table
-ram_tp_nc #(
-    .ADDR_BITS(TCP_SID_BITS),
-    .DATA_BITS(16)
-) isnt_rx_conn (
-    .clk(aclk),
-    .a_en(1'b1),
-    .a_we(rx_wr),
-    .a_addr(rx_addr),
-    .b_en(rx_en),
-    .b_addr(s_rx_meta.data.sid),
-    .a_data_in(rx_data),
-    .a_data_out(rx_data_out),
-    .b_data_out(rx_rsid)
-);
-
-// TX table
-ram_tp_nc #(
-    .ADDR_BITS(DEST_BITS+PID_BITS),
-    .DATA_BITS(16)
-) isnt_tx_conn (
-    .clk(aclk),
-    .a_en(1'b1),
-    .a_we(tx_wr),
-    .a_addr(tx_addr),
-    .b_en(tx_en),
-    .b_addr({s_tx_meta_r.data.vfid, s_tx_meta_r.data.pid}),
-    .a_data_in(tx_data),
-    .a_data_out(tx_data_out),
-    .b_data_out(tx_sid)
-);
-
-metaIntf #(.STYPE(tcp_meta_r_t)) rx_meta_q ();
-metaIntf #(.STYPE(tcp_meta_t)) tx_meta_q ();
-
-always_ff @(posedge aclk) begin
-    if (~aresetn) begin
-        rx_meta_q.valid <= 1'b0;
-        tx_meta_q.valid <= 1'b0;
-
-        rx_meta_q.data <= 0;
-        tx_meta_q.data <= 0;
     end
-    else begin
-        if(rx_meta_q.ready) begin
-            rx_meta_q.valid <= s_rx_meta.valid;
 
-            rx_meta_q.data.len <= s_rx_meta.data.len;
-            rx_meta_q.data.dest <= rx_rsid[0+:DEST_BITS];
-            rx_meta_q.data.pid <= rx_rsid[DEST_BITS+:PID_BITS];
-            rx_meta_q.data.vfid <= rx_rsid[DEST_BITS+PID_BITS+:DEST_BITS];
+    // -- NSL (OPEN) -------------------------------------------------------------
+    always_comb begin : NSL_OPEN
+        o_state_N = o_state_C;
+        case (o_state_C)
+            ST_O_IDLE:     o_state_N = open_req_arb.valid ? ST_O_SEND : ST_O_IDLE;
+            ST_O_SEND:     o_state_N = m_open_req.ready ? ST_O_RSP_WAIT : ST_O_SEND;
+            ST_O_RSP_WAIT: o_state_N = (s_open_rsp.valid && m_open_rsp[o_vfid_C].ready) ? ST_O_IDLE : ST_O_RSP_WAIT;
+            default:       o_state_N = ST_O_IDLE;
+        endcase
+    end
+
+    // -- DP (OPEN) --------------------------------------------------------------
+    always_comb begin : DP_OPEN
+        // Defaults
+        o_port_N = o_port_C;
+        o_addr_N = o_addr_C;
+        o_vfid_N = o_vfid_C;
+
+        open_req_arb.ready         = 1'b0;
+        m_open_req.valid           = 1'b0;
+        m_open_req.data.ip_port    = o_port_C;
+        m_open_req.data.ip_address = o_addr_C;
+
+        for (int i = 0; i < N_REGIONS; i++) begin
+            m_open_rsp[i].valid = 1'b0;
+            m_open_rsp[i].data  = '0;
         end
 
-        if(tx_meta_q.ready) begin
-            tx_meta_q.valid <= s_tx_meta_r.valid;
+        // SID map write defaults
+        sid_we    = '0;
+        sid_waddr = '0;
+        sid_wdata = '0;
 
-            tx_meta_q.data.len <= s_tx_meta_r.data.len;
-            tx_meta_q.data.sid <= tx_sid;
-        end       
+        // RSP capture defaults
+        open_rsp_fire    = 1'b0;
+        open_rsp_success = 1'b0;
+        open_rsp_sid     = '0;
+
+        // Open FSM datapath
+        case (o_state_C)
+            ST_O_IDLE: begin
+                if (open_req_arb.valid) begin
+                    open_req_arb.ready = 1'b1;
+                    o_port_N = open_req_arb.data.ip_port;
+                    o_addr_N = open_req_arb.data.ip_address;
+                    o_vfid_N = vfid_open_arb;
+                end
+            end
+
+            ST_O_SEND: begin
+                m_open_req.valid           = 1'b1;
+                m_open_req.data.ip_port    = o_port_C;
+                m_open_req.data.ip_address = o_addr_C;
+            end
+
+            ST_O_RSP_WAIT: begin
+                // Forward response only to the requester
+                m_open_rsp[o_vfid_C].valid = s_open_rsp.valid;
+                m_open_rsp[o_vfid_C].data  = s_open_rsp.data;
+
+                if (s_open_rsp.valid && m_open_rsp[o_vfid_C].ready) begin
+                    open_rsp_fire    = 1'b1;
+                    open_rsp_success = s_open_rsp.data[0];    // success bit (LSB)
+                    open_rsp_sid     = s_open_rsp.data.sid;   // SID field
+                end
+            end
+
+            default: ;
+        endcase
+
+        // Update map on successful open (no close invalidation)
+        if (open_rsp_fire && open_rsp_success) begin
+            sid_we                     = {SID_WSTRB_BITS{1'b1}};
+            sid_waddr                  = open_rsp_sid[SID_ADDR_BITS-1:0];
+            sid_wdata[SID_DATA_BITS-1] = 1'b1;                           // VALID
+            sid_wdata[VFPGA_BITS-1:0]  = o_vfid_C[VFPGA_BITS-1:0];       // owner VFID (8b)
+        end
     end
-end
 
-queue_meta #(.QDEPTH(16)) inst_rx_q (.aclk(aclk), .aresetn(aresetn), .s_meta(rx_meta_q), .m_meta(m_rx_meta_r));
-queue_meta #(.QDEPTH(16)) inst_tx_q (.aclk(aclk), .aresetn(aresetn), .s_meta(tx_meta_q), .m_meta(m_tx_meta));
+    // -- READY (OPEN RSP) -------------------------------------------------------
+    always_comb begin : READY_OPEN_RSP
+        s_open_rsp.ready = (o_state_C == ST_O_RSP_WAIT) ? m_open_rsp[o_vfid_C].ready : 1'b0;
+    end
 
-assign rx_en = rx_meta_q_ready;
-assign tx_en = tx_meta_q_ready;
+    // -- NSL (NOTIFY) -----------------------------------------------------------
+    always_comb begin : NSL_NOTIFY
+        n_state_N = n_state_C;
+        case (n_state_C)
+            N_IDLE:      n_state_N = s_notify.valid ? N_SID_LUP : N_IDLE;
+            N_SID_LUP:   n_state_N = N_PICK;                 // 1-cycle SID-map read latency
+            N_PICK:      n_state_N = sid_hit ? N_ROUTE : N_PT_LOOKUP;
+            N_PT_LOOKUP: n_state_N = N_ROUTE;                // 1-cycle wait for port table output
+            N_ROUTE:     n_state_N = N_ROUTE;                // DP will advance to IDLE on ready
+            default:     n_state_N = N_IDLE;
+        endcase
+    end
 
-`AXIS_ASSIGN(s_axis_rx, m_axis_rx_r)
-`AXIS_ASSIGN(s_axis_tx_r, m_axis_tx)
+    // -- DP (NOTIFY) ------------------------------------------------------------
+    always_comb begin : DP_NOTIFY
+        // Defaults
+        not_N = not_C;
 
+        // 1-entry input buffer behavior
+        s_notify.ready = (n_state_C == N_IDLE);
+
+        // SID-map read address (truncate)
+        sid_raddr = not_C.sid[SID_ADDR_BITS-1:0];
+
+        // Output defaults
+        for (int i = 0; i < N_REGIONS; i++) begin
+            m_notify[i].valid = 1'b0;
+            m_notify[i].data  = not_C;
+        end
+        port_addr = '0;
+
+        // Route latches
+        route_vfid_N     = route_vfid_C;
+        route_sel_sid_N  = route_sel_sid_C;
+        route_pt_valid_N = route_pt_valid_C;
+
+        case (n_state_C)
+            N_IDLE: begin
+                if (s_notify.valid) begin
+                    not_N = s_notify.data; // capture payload
+                end
+            end
+
+            N_SID_LUP: begin
+                // sid_rdata valid next cycle
+            end
+
+            N_PICK: begin
+                if (sid_hit) begin
+                    route_vfid_N     = vf_cast8(vfid_from_sid_8);
+                    route_sel_sid_N  = 1'b1;      // choose SID route
+                    route_pt_valid_N = 1'b0;
+                end
+                else begin
+                    // trigger port-table lookup by sending full port
+                    port_addr        = not_C.dst_port;
+                    route_sel_sid_N  = 1'b0;      // choose port route
+                    route_pt_valid_N = 1'b0;      // will latch in next state
+                end
+            end
+
+            N_PT_LOOKUP: begin
+                // latch rsid_in after 1-cycle wait
+                if (!sid_hit) begin
+                    route_pt_valid_N = pt_valid_now;
+                    route_vfid_N     = vf_cast8(vfid_from_port_8);
+                end
+            end
+
+            N_ROUTE: begin
+                // use only latched values
+                logic route_has_dst;
+                route_has_dst = route_sel_sid_C || route_pt_valid_C;
+
+                if (route_has_dst) begin
+                    m_notify[route_vfid_C].valid = 1'b1;
+                    m_notify[route_vfid_C].data  = not_C;
+
+                    if (m_notify[route_vfid_C].ready) begin
+                        route_sel_sid_N  = 1'b0;
+                        route_pt_valid_N = 1'b0;
+                        n_state_N        = N_IDLE;
+                    end
+                end
+                else begin
+                    // drop on no destination, then return to IDLE
+                    n_state_N = N_IDLE;
+                end
+            end
+
+            default: ;
+        endcase
+    end
+
+    ram_tp_c #(
+        .ADDR_BITS (SID_ADDR_BITS),   // 8
+        .DATA_BITS (SID_DATA_BITS)    // 9: {VALID, VFID[7:0]}
+    ) i_sid2vfid (
+        .clk        (aclk),
+
+        .a_en       (1'b1),
+        .a_we       (sid_we),
+        .a_addr     (sid_waddr),
+        .a_data_in  (sid_wdata),
+        .a_data_out (/*unused*/),
+
+        .b_en       (1'b1),
+        .b_addr     (sid_raddr),
+        .b_data_out (sid_rdata)
+    );
 
 endmodule
